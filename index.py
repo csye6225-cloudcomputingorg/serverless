@@ -3,6 +3,7 @@ import json
 import boto3
 import logging
 from google.cloud import storage
+from google.oauth2 import service_account
 import requests
 import base64
 import sys
@@ -58,7 +59,8 @@ print(sns)
 #     )
 
 
-def download_release_and_store_in_gcs(release_url, release_tag, secret_key, user_email):
+def download_release_and_store_in_gcs(release_url, release_tag, secret_key, user_email,
+                                      mailgun_api_key, mailgun_domain, from_email, email_subject):
     
     print("download_release_and_store_in_gcs called")
     
@@ -77,8 +79,16 @@ def download_release_and_store_in_gcs(release_url, release_tag, secret_key, user
     
     print(response)
     
+    if response.status_code != 200:
+        email_text = "Invalid URL. Doesn't Point to Valid Submission File"
+        email_status = send_email(mailgun_api_key, mailgun_domain, from_email, email_subject, email_text)
+        track_email_sent_in_dynamodb(user_email, email_status)
+    
     # Check if the request was successful (status code 200)
     if response.status_code == 200:
+        
+        print(response.content)
+        
         # Upload release to Google Cloud Storage
         with open("/tmp/github_release.zip", "wb") as f:
             f.write(response.content)
@@ -86,8 +96,8 @@ def download_release_and_store_in_gcs(release_url, release_tag, secret_key, user
         print("response OK")
         # gcs_client = storage.Client()
         print(secret_key)
-        gcs_client = storage.Client.from_service_account_info(secret_key)
-        
+        gcs_creds = service_account.Credentials.from_service_account_info(secret_key)
+        gcs_client = storage.Client(credentials=gcs_creds)
         gcs_bucket = gcs_client.bucket(gcs_bucket_name)
         blob = gcs_bucket.blob(
            f"{github_repo_name}_{unique_object_name}_{release_tag}.zip")
@@ -109,27 +119,28 @@ def send_email(api_key, domain, from_email, to_email, subject, text):
     }
 
     response = requests.post(mailgun_url, auth=auth, data=data)
-    print(response)
+    response_data = response.json()
 
-    if response.status_code == 200:
-        print("Email sent successfully!")
+    # Check the 'event' attribute in the response
+    if 'event' in response_data:
+        event = response_data['event']
+        if event == 'delivered':
+            return "Email delivered successfully!"
+        elif event == 'accepted':
+            return "Email accepted for delivery."
+        else:
+            return f"Failed to send email. Event: {event}"
     else:
         print(f"Failed to send email. Status code: {response.status_code}")
         print(response.text)
 
 
-def track_email_sent_in_dynamodb(sns_message):
+def track_email_sent_in_dynamodb(user_email, status):
     
     email_data_success = {
-        'Id': sns_message.get('user_email', ''),
-        'Email': sns_message.get('user_email', ''),
-        'Status': 'Sent',
-    }
-    
-    email_data_fail = {
-        'Id': sns_message.get('user_email', ''),
-        'Email': sns_message.get('user_email', ''),
-        'Status': 'Failed',
+        'Id': user_email,
+        'Email': user_email,
+        'Status': status,
     }
     
     response = ddb_table.put_item(
@@ -192,27 +203,29 @@ def lambda_handler(event, context):
         print(to_email_sns)
 
 
-    # Task 1: Download the release from GitHub and store it in Google Cloud Storage
-    download_status = download_release_and_store_in_gcs(release_url, sns_message.get('release_tag'),  service_account_key_json, to_email_sns)
-    print(download_status)
-
-    domain = "adityasrprakash.me"
-
     # Replace these with your Mailgun API key, domain, and email addresses
     mailgun_api_key = "4dc82ba6f91f8bbf597a3aeced3ef791-30b58138-ae50c84a"
     mailgun_domain = domain
     from_email = "prakash.adi@northeastern.edu"
-    to_email = "adityaprakash41@gmail.com"
+    to_email = to_email_sns
     email_subject = "Download Status"
     email_text = "The download is complete. Please check your attachment."
+    
+
+    # Task 1: Download the release from GitHub and store it in Google Cloud Storage
+    download_status = download_release_and_store_in_gcs(release_url, sns_message.get('release_tag'),  service_account_key_json, to_email_sns, 
+                                                        mailgun_api_key, mailgun_domain, from_email, email_subject, email_text)
+    print(download_status)
+
+    domain = "adityasrprakash.me"
 
     # Task 2: Email the user the status of the download
     if download_status:
-        send_email(mailgun_api_key, mailgun_domain, from_email,
+        email_status = send_email(mailgun_api_key, mailgun_domain, from_email,
            to_email, email_subject, email_text)
     
     # Task 3: Track the emails sent in DynamoDB
-    track_email_sent_in_dynamodb(sns_message)
+    track_email_sent_in_dynamodb(to_email_sns, email_status)
 
     # Task 4: Send SNS notification
     # send_sns_notification(
