@@ -6,122 +6,138 @@ from google.cloud import storage
 from google.oauth2 import service_account
 import requests
 import base64
-import sys
+from datetime import datetime
+import time
 from uuid import uuid4
-      
-search_path = sys.path
-print(search_path)
-
-# local_download_path = "/home/admin/webapp/"
-# blob_name = "v1.0.0.zip"
-project_id = "gcp-demo-csye6225"
-print(os.environ.get('GOOOGLE_PROJECT_ID'))
-
-for key, value in os.environ.items():
-        print(f"{key}: {value}")
-
+   
 # Configure the logging module
 logging.basicConfig(level=logging.INFO)
 
-# AWS configuration
-aws_region = "us-east-1"
-sns_topic_arn = os.environ.get('SNS_TOPIC_ARN')
-dynamodb_table_name = "emailTrackerTable"
-print(os.environ.get('DYNAMODB_TABLE_NAME'))
-print(os.environ.get('AWS_REGION'))
-
-print(aws_region + " : " + sns_topic_arn + " : " + dynamodb_table_name + " : ")
-
-# Google Cloud Storage configuration
-gcs_bucket_name = "submission-bucket"
-print(os.environ.get('BUCKET_NAME'))
-
-print(gcs_bucket_name)
-
 # DynamoDB configuration
-dynamodb = boto3.resource("dynamodb", region_name=aws_region)
-ddb_table = dynamodb.Table(dynamodb_table_name)
-
-print(dynamodb)
-print(ddb_table)
-
-# AWS SNS configuration
-sns = boto3.client("sns", region_name=aws_region)
-
-print(sns)
-
-# def send_sns_notification(message):
-#     print("send notification called")
-#     sns.publish(
-#         TopicArn=sns_topic_arn,
-#         Message=message,
-#         Subject="GitHub Release Download Status"
-#     )
+dynamodb = boto3.resource("dynamodb", region_name=os.environ.get('AWS_REGION'))
+ddb_table = dynamodb.Table(os.environ.get('DYNAMODB_TABLE_NAME'))
 
 
-def download_release_and_store_in_gcs(release_url, release_tag, secret_key, user_email,
-                                      mailgun_api_key, mailgun_domain, from_email, email_subject):
+def check_email_status(user_email):
+   
+    secrets_manager_client = boto3.client('secretsmanager')
+    
+    api_secret_response = secrets_manager_client.get_secret_value(
+        SecretId=os.environ.get('API_SECRET_ARN')
+    )
+    
+    mailgun_api_key = api_secret_response['SecretString']
+    
+    # Get the latest message for the user_email
+    messages_url = os.environ.get('MAILGUN_STATUS_URL')
+    params = {'recipient': user_email}
+    headers = {'Authorization': f'Basic {base64.b64encode(f"api:{mailgun_api_key}".encode()).decode()}'}
+
+    max_attempts = 3
+    for attempt in range(max_attempts):
+        try:
+            response = requests.get(messages_url, params=params, headers=headers)
+            response.raise_for_status()
+            response_json = response.json()
+            print(f"mailgun status response {attempt}")
+            print(response_json)
+
+            # Check if there are any events
+            if response_json['items']:
+                latest_event = response_json['items'][0]
+                event_type = latest_event.get('event', '')
+
+                if event_type == 'accepted':
+                    return "Email accepted for delivery"
+                elif event_type == 'delivered':
+                    return "Email delivered successfully"
+                elif event_type == 'failed':
+                    return "Email delivery failed"
+                else:
+                    print(f"Attempt {attempt + 1}/{max_attempts}: Email event type is {event_type}. Waiting for 10 seconds...")
+        except requests.exceptions.RequestException as e:
+            return f"Failed to check email status: {str(e)}"
+        except Exception as e:
+            return f"Failed to check email status: {str(e)}"
+
+        time.sleep(10)
+
+    return "Max attempts reached. Email status not confirmed."
+
+
+def download_release_and_store_in_gcs(release_url, release_tag, user_email):
     
     print("download_release_and_store_in_gcs called")
     
-    # Download release from GitHub
+    secrets_manager_client = boto3.client('secretsmanager')
 
-    # Remove unnecessary parts of the URL
-    # repo_name_with_extension = release_url.rsplit('/', 1)[-1].split('/archive')[0]
-    # release_tag_with_extension = release_url.split("/")[-1]
+    # Retrieve the secret value
+    gcp_secret_response = secrets_manager_client.get_secret_value(
+        SecretId=os.environ.get('GOOGLE_ACCESS_SECRET_ARN')
+    )
+    
+    # Parse the secret string as JSON
+    service_account_key = gcp_secret_response['SecretString']
+    secret_key = json.loads(base64.b64decode(service_account_key).decode('utf-8'))
+    
 
-    # Extract repo name and release tag without extension
+    # Extract repo name
     github_repo_name = release_url.rsplit('/', 1)[-1].split('/archive')[0]
-    # github_release_tag, _ = os.path.splitext(release_tag_with_extension)[0]
     unique_object_name = f"{user_email}_{str(uuid4())}"
-
+    
     response = requests.get(release_url)
     
-    print(response)
+    file_content_type = response.headers.get('content-type')
     
     if response.status_code != 200:
         email_text = "Invalid URL. Doesn't Point to Valid Submission File"
-        email_status = send_email(mailgun_api_key, mailgun_domain, from_email, email_subject, email_text)
+        send_email(user_email, email_text)
+        email_status = check_email_status(user_email)
         track_email_sent_in_dynamodb(user_email, email_status)
-    
-    # Check if the request was successful (status code 200)
-    if response.status_code == 200:
-        
-        print(response.content)
-        
-        # Upload release to Google Cloud Storage
+    elif file_content_type != 'application/zip' and not release_url.endswith('.zip'):
+        email_text="Download Error", "The downloaded file is not a zip file."
+        send_email(user_email, email_text)
+        email_status = check_email_status(user_email)
+        track_email_sent_in_dynamodb(user_email, email_status)
+    elif response.status_code == 200:
         with open("/tmp/github_release.zip", "wb") as f:
             f.write(response.content)
-       
-        print("response OK")
-        # gcs_client = storage.Client()
-        print(secret_key)
+        
         gcs_creds = service_account.Credentials.from_service_account_info(secret_key)
         gcs_client = storage.Client(credentials=gcs_creds)
-        gcs_bucket = gcs_client.bucket(gcs_bucket_name)
+        gcs_bucket = gcs_client.bucket(os.environ.get('BUCKET_NAME'))
         blob = gcs_bucket.blob(
            f"{github_repo_name}_{unique_object_name}_{release_tag}.zip")
         blob.upload_from_filename("/tmp/github_release.zip")
 
-        return True
+        email_text = "Assignment Submitted Successfully."
+        send_email(user_email, email_text)
+        email_status = check_email_status(user_email)
+        track_email_sent_in_dynamodb(user_email, email_status)
     else:
+        email_text = f"Unexpected Error {response}"
+        send_email(user_email, email_text)
+        email_status = check_email_status(user_email)
+        track_email_sent_in_dynamodb(user_email, email_status)
         return False
 
 
-def send_email(api_key, domain, from_email, to_email, subject, text):
-    mailgun_url = f"https://api.mailgun.net/v3/{domain}/messages"
-    auth = ("api", api_key)
+def send_email(to_email, text):
+    
+    mailgun_url = os.environ.get('MAILGUN_MESSAGE_URL')
+    email_subject = "Assignment Submission Status"
+    
+    auth = ("api", os.environ.get('MAILGUN_API_KEY'))
     data = {
-        "from": from_email,
+        "from": os.environ.get('FROM_EMAIL'),
         "to": to_email,
-        "subject": subject,
+        "subject": email_subject,
         "text": text
     }
-
+    
     response = requests.post(mailgun_url, auth=auth, data=data)
     response_data = response.json()
-
-    # Check the 'event' attribute in the response
+    
     if 'event' in response_data:
         event = response_data['event']
         if event == 'delivered':
@@ -137,58 +153,25 @@ def send_email(api_key, domain, from_email, to_email, subject, text):
 
 def track_email_sent_in_dynamodb(user_email, status):
     
-    email_data_success = {
-        'Id': user_email,
-        'Email': user_email,
-        'Status': status,
-    }
+    current_timestamp = datetime.now().isoformat()
     
-    response = ddb_table.put_item(
+    email_data_success = {
+        'email': user_email,
+        'status': status + "_" + current_timestamp if status is not None else "Queued"
+    }
+     
+    ddb_table.put_item(
         Item=email_data_success
     )
-    
-    print(response)
 
 
 def lambda_handler(event, context):
-
-    # Create an AWS Secrets Manager client
-    secrets_manager_client = boto3.client('secretsmanager')
-
-    # Retrieve the secret value
-    secret_response = secrets_manager_client.get_secret_value(
-        SecretId=os.environ.get('GOOGLE_ACCESS_SECRET_ARN')
-    )
-
-    print(secret_response)
-
-    # Parse the secret string as JSON
-    service_account_key = secret_response['SecretString']
-
-    print(service_account_key)
     
-    # Access individual secret values
-    # access_key = secret_data[0]
-    # secret_key = secret_data[1]
-    
-    service_account_key_json = json.loads(base64.b64decode(service_account_key).decode('utf-8'))
-    print(base64.b64decode(service_account_key).decode('utf-8'))
-    print(service_account_key_json)
-
     if 'Records' in event and len(event['Records']) > 0:
-        # Assuming event is the dictionary containing your SNS message
+        
         sns_message_str = event['Records'][0]['Sns']['Message']
-
-        # Print or log the original string
-        print(f"Original SNS Message String: {sns_message_str}")
-
-        # Replace single quotes with double quotes
         sns_message_str = sns_message_str.replace("'", "\"")
 
-        # Print or log the modified string
-        print(f"Modified SNS Message String: {sns_message_str}")
-
-        # Now parse the modified string as JSON
         try:
             sns_message = json.loads(sns_message_str)
             print("Successfully parsed JSON:", sns_message)
@@ -201,32 +184,42 @@ def lambda_handler(event, context):
         
         to_email_sns = sns_message.get('user_email', '')
         print(to_email_sns)
-
-
-    # Replace these with your Mailgun API key, domain, and email addresses
-    mailgun_api_key = "4dc82ba6f91f8bbf597a3aeced3ef791-30b58138-ae50c84a"
-    mailgun_domain = domain
-    from_email = "prakash.adi@northeastern.edu"
-    to_email = to_email_sns
-    email_subject = "Download Status"
-    email_text = "The download is complete. Please check your attachment."
+        
+        status = sns_message.get('status')
+        print(sns_message.get('status'))
+        
     
-
-    # Task 1: Download the release from GitHub and store it in Google Cloud Storage
-    download_status = download_release_and_store_in_gcs(release_url, sns_message.get('release_tag'),  service_account_key_json, to_email_sns, 
-                                                        mailgun_api_key, mailgun_domain, from_email, email_subject, email_text)
-    print(download_status)
-
-    domain = "adityasrprakash.me"
-
-    # Task 2: Email the user the status of the download
-    if download_status:
-        email_status = send_email(mailgun_api_key, mailgun_domain, from_email,
-           to_email, email_subject, email_text)
-    
-    # Task 3: Track the emails sent in DynamoDB
-    track_email_sent_in_dynamodb(to_email_sns, email_status)
-
-    # Task 4: Send SNS notification
-    # send_sns_notification(
-        # f"GitHub release download status: {'Success' if download_status else 'Failure'}")
+    if(status == 'success'):
+        # Download the release from GitHub and store it in Google Cloud Storage
+        download_release_and_store_in_gcs(release_url, sns_message.get('release_tag'), to_email_sns )
+    elif (status == 'not_found'):
+        email_text = "Assignment Not Found"
+        send_email(to_email_sns, email_text)
+        email_status = check_email_status(to_email_sns)
+        track_email_sent_in_dynamodb(to_email_sns, email_status)
+    elif (status == 'deadline_passed'):
+        email_text = "The submission deadline has passed. No further submissions are allowed."
+        send_email(to_email_sns, email_text)
+        email_status = check_email_status(to_email_sns)
+        track_email_sent_in_dynamodb(to_email_sns, email_status)
+    elif (status == 'invalid_url'):
+        email_text = "Invalid Submission URL. Please Check the URL and try again."
+        send_email(to_email_sns, email_text)
+        email_status = check_email_status(to_email_sns)
+        track_email_sent_in_dynamodb(to_email_sns, email_status)
+    elif (status == 'bad_request'):
+        email_text = "Bad Request. Please Check the Request."
+        send_email(to_email_sns, email_text)
+        email_status = check_email_status(to_email_sns)
+        track_email_sent_in_dynamodb(to_email_sns, email_status)
+    elif (status == 'attempts_exceeded'):
+        email_text = "Number of Attempts Exceeded. No further submissions are allowed."
+        send_email(to_email_sns, email_text)
+        email_status = check_email_status(to_email_sns)
+        track_email_sent_in_dynamodb(to_email_sns, email_status)
+    elif (status == 'unauthorised'):
+        email_text = "Unauthorised, Please check your credentials."
+        send_email(to_email_sns, email_text)
+        email_status = check_email_status(to_email_sns)
+        track_email_sent_in_dynamodb(to_email_sns, email_status)
+        
